@@ -1,0 +1,765 @@
+--- a/core/cart_hw/paprium.h
++++ b/core/cart_hw/paprium.h
+@@ -17,22 +17,308 @@
+ #include "minimp3_ex.h"
+ 
+ 
+-static mp3dec_t paprium_mp3d;
+-static mp3dec_file_info_t paprium_mp3d_info;
++/* ------------------------------------------------------------------------
++ * Musica do Paprium em streaming.
++ *
++ * O core original decodificava o MP3 inteiro para a RAM (mp3dec_load): uma
++ * faixa de ~10 min em 48 kHz estereo ocupa ~112 MB, e o jogo pede uma faixa
++ * nova em cima da anterior (o decode duplicado sozinho custava ~12 s de
++ * travamento). Aqui o MP3 fica no cartao e e' decodificado sob demanda, em
++ * pedacos pequenos, mantendo um ring de amostras estereo de 16 bits.
++ * RAM constante: PAPRING_FRAMES*4 + PAPIN_BYTES (~ 128 KB).
++ *
++ * O ring e' abastecido alguns quadros por vez dentro de paprium_audio(),
++ * para nao abrir um buraco de dezenas de ms na saida de audio.
++ * ---------------------------------------------------------------------- */
+ 
+-static mp3dec_t paprium_mp3d_boss1;
+-static mp3dec_file_info_t paprium_mp3d_info_boss1;
++/* Ligado por padrao; o build final passa -DPAPRIUM_TRACE=0 para gerar um
++   core sem log (mais rapido e sem gravar PDBG no cartao). */
++#ifndef PAPRIUM_TRACE
++#define PAPRIUM_TRACE 1
++#endif
++#ifndef PAPRIUM_TRACE_1FEA
++#define PAPRIUM_TRACE_1FEA 1
++#endif
+ 
+-static mp3dec_t paprium_mp3d_boss2;
+-static mp3dec_file_info_t paprium_mp3d_info_boss2;
++#ifdef _WIN32
++#include <io.h>
++#define pap_trace_write _write
++#else
++#include <unistd.h>
++#define pap_trace_write write
++#endif
++#include <string.h>
+ 
+-static mp3dec_t paprium_mp3d_boss3;
+-static mp3dec_file_info_t paprium_mp3d_info_boss3;
++#if PAPRIUM_TRACE
++#define PAPW(...) do { \
++	char _b[224]; \
++	int _n = snprintf(_b, sizeof _b, "PDBG " __VA_ARGS__); \
++	if (_n < 0) break; \
++	if (_n > (int)sizeof _b - 2) _n = (int)sizeof _b - 2; \
++	_b[_n++] = '\n'; \
++	if (pap_trace_write(2, _b, _n) < 0) break; \
++} while (0)
++#else
++#define PAPW(...) do { } while (0)
++#endif
+ 
+-static mp3dec_t paprium_mp3d_boss4;
+-static mp3dec_file_info_t paprium_mp3d_info_boss4;
++#define PAPRING_FRAMES  16384   /* ~0,34 s a 48 kHz */
++#define PAPRING_LOW      8192   /* abaixo disso, decodifica mais */
++#define PAPIN_BYTES     (64 * 1024)
+ 
++static FILE *pap_stream_fp;
++static mp3dec_t pap_stream_dec;
++static uint8_t pap_stream_in[PAPIN_BYTES];
++static int pap_stream_in_size;
++static int pap_stream_in_pos;
++static int pap_stream_data_start;   /* offset do 1o quadro MP3 (depois do ID3) */
++static int16_t pap_stream_pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
++static int16_t pap_stream_l[PAPRING_FRAMES];
++static int16_t pap_stream_r[PAPRING_FRAMES];
++static int pap_stream_rd;
++static int pap_stream_wr;
++static int pap_stream_cnt;
++static int pap_stream_hz;
++static int pap_stream_loops;
++
++static void pap_stream_close(void)
++{
++	if (pap_stream_fp) {
++		fclose(pap_stream_fp);
++		pap_stream_fp = NULL;
++	}
++	pap_stream_in_size = 0;
++	pap_stream_in_pos = 0;
++	pap_stream_data_start = 0;
++	pap_stream_rd = 0;
++	pap_stream_wr = 0;
++	pap_stream_cnt = 0;
++	pap_stream_hz = 0;
++}
++
++/* pula o ID3v2 do inicio (capa embutida pode ter alguns MB e faria o
++   decodificador varrer tudo procurando sincronismo) */
++static int pap_stream_skip_id3(FILE *fp)
++{
++	uint8_t h[10];
++	int off = 0;
++
++	if (fread(h, 1, 10, fp) == 10 && h[0] == 'I' && h[1] == 'D' && h[2] == '3') {
++		off = ((h[6] & 0x7f) << 21) | ((h[7] & 0x7f) << 14) |
++		      ((h[8] & 0x7f) << 7) | (h[9] & 0x7f);
++		off += 10;
++		if (h[5] & 0x10)   /* footer */
++			off += 10;
++	}
++
++	/* se o tamanho do ID3 nao fizer sentido, ignora o pulo */
++	if (fseek(fp, 0, SEEK_END) == 0) {
++		long size = ftell(fp);
++		if (size <= 0 || off >= size)
++			off = 0;
++	}
++
++	if (fseek(fp, off, SEEK_SET) != 0)
++		off = 0;
++	return off;
++}
++
++static int pap_stream_open(const char *path)
++{
++	pap_stream_close();
++
++	pap_stream_fp = fopen(path, "rb");
++	if (!pap_stream_fp) {
++		PAPW("mp3: nao abriu %s", path);
++		return 0;
++	}
++
++	pap_stream_data_start = pap_stream_skip_id3(pap_stream_fp);
++	mp3dec_init(&pap_stream_dec);
++	pap_stream_loops = 0;
++
++	return 1;
++}
++
++static void pap_stream_rewind(void)
++{
++	fseek(pap_stream_fp, pap_stream_data_start, SEEK_SET);
++	mp3dec_init(&pap_stream_dec);
++	pap_stream_in_size = 0;
++	pap_stream_in_pos = 0;
++	pap_stream_loops++;
++	PAPW("mp3: loop %d", pap_stream_loops);
++}
++
++/* le' mais dados do arquivo; 0 = fim (ou buffer cheio) */
++static int pap_stream_read_more(void)
++{
++	int n;
++
++	if (pap_stream_in_pos > 0) {
++		int rest = pap_stream_in_size - pap_stream_in_pos;
++		memmove(pap_stream_in, pap_stream_in + pap_stream_in_pos, rest);
++		pap_stream_in_size = rest;
++		pap_stream_in_pos = 0;
++	}
++
++	if (pap_stream_in_size >= PAPIN_BYTES)
++		return 0;
++
++	n = fread(pap_stream_in + pap_stream_in_size, 1,
++	          PAPIN_BYTES - pap_stream_in_size, pap_stream_fp);
++	if (n <= 0)
++		return 0;
++
++	pap_stream_in_size += n;
++	return 1;
++}
++
++/* decodifica um quadro MP3 para o ring; 0 se nao produziu amostras */
++static int pap_stream_decode_one(void)
++{
++	int tentativas = 0;
++	mp3dec_frame_info_t info;
++	int frames, i, ch;
++
++	for (;;) {
++		if (!pap_stream_fp)
++			return 0;
++
++		if (pap_stream_in_pos >= pap_stream_in_size) {
++			if (!pap_stream_read_more()) {
++				if (++tentativas > 2) {
++					PAPW("mp3: arquivo sem quadros validos, fecha");
++					pap_stream_close();
++					return 0;
++				}
++				pap_stream_rewind();
++				continue;
++			}
++		}
++
++		memset(&info, 0, sizeof(info));
++		frames = mp3dec_decode_frame(&pap_stream_dec,
++		                             pap_stream_in + pap_stream_in_pos,
++		                             pap_stream_in_size - pap_stream_in_pos,
++		                             pap_stream_pcm, &info);
++
++		if (info.frame_bytes <= 0) {
++			/* quadro cortado no fim do bloco: precisa de mais bytes */
++			if (!pap_stream_read_more()) {
++				if (++tentativas > 2) {
++					PAPW("mp3: fim/erro, fecha");
++					pap_stream_close();
++					return 0;
++				}
++				pap_stream_rewind();
++			}
++			continue;
++		}
++
++		pap_stream_in_pos += info.frame_bytes;
++
++		if (frames <= 0)
++			continue;
++
++		ch = info.channels;
++		if (info.hz && info.hz != pap_stream_hz) {
++			pap_stream_hz = info.hz;
++			PAPW("mp3: %d Hz %d ch", info.hz, ch);
++		}
++
++		for (i = 0; i < frames && pap_stream_cnt < PAPRING_FRAMES; i++) {
++			int16_t l = pap_stream_pcm[i * ch];
++			int16_t r = (ch > 1) ? pap_stream_pcm[i * ch + 1] : l;
++
++			pap_stream_l[pap_stream_wr] = l;
++			pap_stream_r[pap_stream_wr] = r;
++			pap_stream_wr = (pap_stream_wr + 1) % PAPRING_FRAMES;
++			pap_stream_cnt++;
++		}
++		return 1;
++	}
++}
++
++static void pap_stream_pump(void)
++{
++	int n = 0;
++
++	while (pap_stream_cnt < PAPRING_LOW && n++ < 8 && pap_stream_fp)
++		if (!pap_stream_decode_one())
++			break;
++}
++
++/* proxima amostra estereo; silencio se nao ha' musica */
++static void pap_stream_next(int *l, int *r)
++{
++	*l = 0;
++	*r = 0;
++
++	if (pap_stream_cnt < PAPRING_LOW)
++		pap_stream_pump();
++
++	if (pap_stream_cnt > 0) {
++		*l = pap_stream_l[pap_stream_rd];
++		*r = pap_stream_r[pap_stream_rd];
++		pap_stream_rd = (pap_stream_rd + 1) % PAPRING_FRAMES;
++		pap_stream_cnt--;
++	}
++}
++
+ static int paprium_track_last;
++
++/* PC da instrucao em execucao. Definido/setado em m68k/m68kcpu.c pelo
++   build-paprium-core-v2.sh (o prev_pc do core so' existe com DEBUG_TRACE). */
++extern unsigned int pap_last_pc;
++
++/* v9: ring de PCs/SP e snapshots, definidos em m68k/m68kcpu.c (PATCH-PAPRIUM) */
++#define PAP_RING_N 2048
++extern unsigned int pap_ring_pc[PAP_RING_N];
++extern unsigned int pap_ring_sp[PAP_RING_N];
++extern unsigned int pap_ring_i;
++extern unsigned int pap_snap_pc[PAP_RING_N];
++extern unsigned int pap_snap_sp[PAP_RING_N];
++extern unsigned int pap_snap_n;
++extern unsigned int pap_snap_i;
++extern unsigned int pap_snap_bad;
++extern unsigned int pap_bad_hits;
++extern unsigned int pap_hist[256];
++extern unsigned int pap_snap_regs[16];
++extern unsigned int pap_snap_sr;
++extern unsigned int pap_snap_ipl;
++extern unsigned int pap_snap_stop;
++extern unsigned int pap_snap_pcval;
++/* snapshot do instante em que o SP (A7) cai para < 0x100 */
++extern unsigned int pap_sp_pc[PAP_RING_N];
++extern unsigned int pap_sp_sp[PAP_RING_N];
++extern unsigned int pap_sp_n;
++extern unsigned int pap_sp_i;
++extern unsigned int pap_sp_pcval;
++extern unsigned int pap_sp_hits;
++extern unsigned int pap_sp_low;
++extern unsigned int pap_sp_regs[16];
++extern unsigned int pap_sp_sr;
++extern unsigned int pap_sp_ipl;
++extern unsigned int pap_sp_stop;
++
++/* trace do registro de status 0x1FEA (ver PAPRIUM_TRACE_1FEA) */
++static unsigned int pap_1fea_rd;
++static unsigned int pap_1fea_wr;
++static unsigned int pap_1fea_r8;
++static unsigned int pap_1fea_w8;
++static unsigned int pap_last_access_tick;
++static unsigned int pap_silence_done;
++static unsigned int pap_ram_dump_done;
++static unsigned int pap_bad_dumps;
++static unsigned int pap_sp_done;
++
++/* v10: estado do RNG deterministico do mapper (0x1880-0x1AFF) */
++static unsigned int pap_rng_state = 0x5A17;
++static unsigned int pap_1fea_pc;
++static unsigned int pap_fe4_rd, pap_fe4_pc;
++static unsigned int pap_fe6_rd, pap_fe6_pc;
++static unsigned int pap_cmd_n;
+ extern char g_rom_dir[256];
+ 
+ 
+@@ -228,39 +514,21 @@
+ 
+ 	paprium_s.music_tick = 0;
+ 
+-	if( track != PAPRIUM_BOSS1 && track != PAPRIUM_BOSS2 && track != PAPRIUM_BOSS3 && track != PAPRIUM_BOSS4 ) {
+-		if( mp3dec_load(&paprium_mp3d, name, &paprium_mp3d_info, NULL, NULL) ) {
+-			paprium_s.music_track = 0;
+-			return;
+-		}
++	if( !pap_stream_open(name) )
++	{
++		paprium_s.music_track = 0;
++		return;
+ 	}
++
++	/* o write handler do cartucho e o audio pedem a mesma faixa; marcar aqui
++	   evita decodificar duas vezes (era o que causava o travamento longo) */
++	paprium_track_last = track;
+ }
+ 
+ 
+-static void paprium_load_mp3_boss()
+-{
+-	static char name[512];
++/* paprium_load_mp3_boss() foi removida: nao ha' mais pre-carga em RAM. */
+ 
+-#ifdef _WIN32
+-	sprintf(error_str, "%s\\paprium\\", g_rom_dir);
+-#else
+-	sprintf(error_str, "%s/paprium/", g_rom_dir);
+-#endif
+ 
+-	sprintf(name, "%s04 Drumbass Boss.mp3", error_str);
+-	mp3dec_load(&paprium_mp3d_boss1, name, &paprium_mp3d_info_boss1, NULL, NULL);
+-
+-	sprintf(name, "%s22 Hardcore BP1.mp3", error_str);
+-	mp3dec_load(&paprium_mp3d_boss2, name, &paprium_mp3d_info_boss2, NULL, NULL);
+-
+-	sprintf(name, "%s11 Hardcore BP2.mp3", error_str);
+-	mp3dec_load(&paprium_mp3d_boss3, name, &paprium_mp3d_info_boss3, NULL, NULL);
+-
+-	sprintf(name, "%s38 Hardcore BP3.mp3", error_str);
+-	mp3dec_load(&paprium_mp3d_boss4, name, &paprium_mp3d_info_boss4, NULL, NULL);
+-}
+-
+-
+ static void paprium_music_sheet()
+ {
+ 	int ch;
+@@ -456,60 +724,12 @@
+ 
+ #if 1
+ 	if( paprium_s.music_track ) {
+-		if( paprium_s.music_track == PAPRIUM_BOSS1 ) {
+-			l = paprium_mp3d_info_boss1.buffer[paprium_s.mp3_ptr];
+-			r = paprium_mp3d_info_boss1.buffer[paprium_s.mp3_ptr];
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS2 ) {
+-			l = paprium_mp3d_info_boss2.buffer[paprium_s.mp3_ptr];
+-			r = paprium_mp3d_info_boss2.buffer[paprium_s.mp3_ptr];
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS3 ) {
+-			l = paprium_mp3d_info_boss3.buffer[paprium_s.mp3_ptr];
+-			r = paprium_mp3d_info_boss3.buffer[paprium_s.mp3_ptr];
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS4 ) {
+-			l = paprium_mp3d_info_boss4.buffer[paprium_s.mp3_ptr];
+-			r = paprium_mp3d_info_boss4.buffer[paprium_s.mp3_ptr];
+-		}
+-		else {
+-			l = paprium_mp3d_info.buffer[paprium_s.mp3_ptr];
+-			r = paprium_mp3d_info.buffer[paprium_s.mp3_ptr];
+-		}
++		int ml = 0, mr = 0;
+ 
++		pap_stream_next(&ml, &mr);
+ 
+-		l = (l * paprium_s.music_volume) / 256;
+-		r = (r * paprium_s.music_volume) / 256;
+-
+-
+-		paprium_s.music_tick += 0x10000;
+-		if( paprium_s.music_tick >= 0x10000 ) {
+-			paprium_s.music_tick -= 0x10000;
+-
+-			paprium_s.mp3_ptr += 2;
+-		}
+-
+-
+-		if( paprium_s.music_track == PAPRIUM_BOSS1 ) {
+-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss1.samples)
+-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss1.samples;
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS2 ) {
+-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss2.samples)
+-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss2.samples;
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS3 ) {
+-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss3.samples)
+-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss3.samples;
+-		}
+-		else if( paprium_s.music_track == PAPRIUM_BOSS4 ) {
+-			if( paprium_s.mp3_ptr >= paprium_mp3d_info_boss4.samples)
+-				paprium_s.mp3_ptr -= paprium_mp3d_info_boss4.samples;
+-		}
+-		else {
+-			if( paprium_s.mp3_ptr >= paprium_mp3d_info.samples)
+-				paprium_s.mp3_ptr -= paprium_mp3d_info.samples;
+-		}
++		l = (ml * paprium_s.music_volume) / 256;
++		r = (mr * paprium_s.music_volume) / 256;
+ 	}
+ 
+ 	*out_l = l;
+@@ -685,6 +905,52 @@
+ }
+ 
+ 
++#if PAPRIUM_TRACE_1FEA
++/* v9: despeja o ring de PCs + SP (ultimas instrucoes executadas). O opcode e'
++   lido da RAM do cartucho (0x0000-0xFFFF), da ROM (0x010000-0x7FFFFF) ou da
++   work RAM (0xFF0000+). A memoria do core e' byte-swapped em relacao ao .bin,
++   entao o opcode e' invertido para aparecer na ordem real. */
++static void pap_ring_dump(const char *tag, unsigned int *pcs, unsigned int *sps,
++                          unsigned int n, unsigned int tot, unsigned int *regs,
++                          unsigned int sr, unsigned int ipl, unsigned int stop,
++                          unsigned int pcv, unsigned int bad)
++{
++	unsigned int i, first;
++
++	if( n > PAP_RING_N ) first = n - PAP_RING_N; else first = 0;
++
++	PAPW("RING %s n=%u tot=%u bad=%06X sr=%u ipl=%u stop=%u pc=%06X a6=%06X a7=%08X",
++	     tag, n, tot, bad & 0xffffff, sr, ipl, stop, pcv & 0xffffff,
++	     regs[14] & 0xffffff, regs[15]);
++	PAPW("REGS d0=%08X d1=%08X d2=%08X d3=%08X d4=%08X d5=%08X d6=%08X d7=%08X",
++	     regs[0], regs[1], regs[2], regs[3],
++	     regs[4], regs[5], regs[6], regs[7]);
++	PAPW("REGS a0=%08X a1=%08X a2=%08X a3=%08X a4=%08X a5=%08X a6=%08X a7=%08X",
++	     regs[8], regs[9], regs[10], regs[11],
++	     regs[12], regs[13], regs[14], regs[15]);
++
++	for( i = first; i < n; i++ ) {
++		unsigned int k = (tot - n + i) & (PAP_RING_N - 1);
++		unsigned int pc = pcs[k] & 0xffffff;
++		unsigned int raw = 0;
++
++		if( pc < 0xFFFE )
++			raw = ((unsigned)paprium_s.ram[pc] << 8) | paprium_s.ram[pc + 1];
++		else if( pc < 0x800000 )
++			raw = ((unsigned)cart.rom[pc] << 8) | cart.rom[pc + 1];
++		else if( pc >= 0xFF0000 )
++			raw = ((unsigned)work_ram[pc & 0xFFFF] << 8) | work_ram[(pc + 1) & 0xFFFF];
++
++		/* cart.rom/ram/work_ram guardam os bytes trocados de par */
++		raw = ((raw & 0xff) << 8) | (raw >> 8);
++
++		PAPW("R %04u pc=%06X sp=%08X op=%04X%s", i, pc, sps[k], raw,
++		     (pc == (bad & 0xffffff)) ? " <BAD" : "");
++	}
++}
++#endif
++
++
+ void paprium_audio(int cycles)
+ {
+ 	int lcv;
+@@ -704,7 +970,88 @@
+ 
+ 	paprium_s.audio_tick++;
+ 
++#if PAPRIUM_TRACE_1FEA
++	/* v9: despeja o ring (a) no primeiro PC invalido, (b) no instante em que o
++	   SP cai para < 0x100 e (c) apos ~20 frames sem falar com o mapper. */
++	if( pap_snap_bad && pap_bad_dumps < 2 ) {
++		pap_bad_dumps++;
++		pap_ring_dump("BADPC", pap_snap_pc, pap_snap_sp, pap_snap_n, pap_snap_i,
++		              pap_snap_regs, pap_snap_sr, pap_snap_ipl, pap_snap_stop,
++		              pap_snap_pcval, pap_snap_bad);
++		pap_snap_n = 0;
++		pap_snap_bad = 0;
++	}
++	else if( !pap_sp_done && pap_sp_n ) {
++		pap_sp_done = 1;
++		pap_ring_dump("SPZERO", pap_sp_pc, pap_sp_sp, pap_sp_n, pap_sp_i,
++		              pap_sp_regs, pap_sp_sr, pap_sp_ipl, pap_sp_stop,
++		              pap_sp_pcval, 0);
++	}
++	else if( !pap_silence_done && paprium_s.audio_tick > 300 && pap_last_access_tick &&
++	         (paprium_s.audio_tick - pap_last_access_tick) > 20 ) {
++		unsigned int n = (pap_ring_i < PAP_RING_N) ? pap_ring_i : PAP_RING_N;
++		pap_silence_done = 1;
++		pap_ring_dump("SILENCE", pap_ring_pc, pap_ring_sp, n, pap_ring_i,
++		              (unsigned int *)m68k.dar, (unsigned)m68k.s_flag,
++		              (unsigned)m68k.int_mask, (unsigned)m68k.stopped,
++		              m68k.pc, 0);
++	}
+ 
++	/* v11: foto da area de registradores do mapper num tick fixo, para
++	   comparar PC x aparelho no ponto onde eles se separam (~tick 420). */
++	if( !pap_ram_dump_done && paprium_s.audio_tick >= 416 ) {
++		int _i, _j;
++		pap_ram_dump_done = 1;
++		PAPW("RAMDUMP t=%d src=%04X dst=%04X track=%d seg=%d tick=%d "
++		     "exps=%02X%02X%02X%02X%02X%02X%02X%02X",
++		     paprium_s.audio_tick, paprium_s.draw_src, paprium_s.draw_dst,
++		     paprium_s.music_track, paprium_s.music_segment, paprium_s.music_tick,
++		     paprium_s.exps_ram[0], paprium_s.exps_ram[1], paprium_s.exps_ram[2],
++		     paprium_s.exps_ram[3], paprium_s.exps_ram[4], paprium_s.exps_ram[5],
++		     paprium_s.exps_ram[6], paprium_s.exps_ram[7]);
++		for( _i = 0; _i < 0x2000; _i += 16 ) {
++			char _rb[224];
++			int _n = snprintf(_rb, sizeof _rb, "PDBG RAM %04X", _i);
++			for( _j = 0; _j < 16; _j++ )
++				_n += snprintf(_rb + _n, sizeof _rb - _n, " %02X",
++				               paprium_s.ram[_i + _j]);
++			_rb[_n++] = '\n';
++			pap_trace_write(2, _rb, _n);
++		}
++	}
++#endif
++
++#if PAPRIUM_TRACE_1FEA
++	/* batimento leve: mostra onde o 68k esta' e onde ele gasta o tempo.
++	   hot = 3 paginas de 256 bytes mais executadas desde a linha anterior. */
++	if( (paprium_s.audio_tick & 15) == 0 ) {
++		int i, b1 = -1, b2 = -1, b3 = -1;
++		unsigned int n1 = 0, n2 = 0, n3 = 0, tot = 0;
++
++		for( i = 0; i < 256; i++ ) {
++			unsigned int n = pap_hist[i];
++			tot += n;
++			if( n > n1 ) { b3 = b2; n3 = n2; b2 = b1; n2 = n1; b1 = i; n1 = n; }
++			else if( n > n2 ) { b3 = b2; n3 = n2; b2 = i; n2 = n; }
++			else if( n > n3 ) { b3 = i; n3 = n; }
++			pap_hist[i] = 0;
++		}
++
++		PAPW("audio tick=%d track=%d ring=%d ipc=%06X sp=%06X v=%d bad=%u stop=%u",
++		     paprium_s.audio_tick, paprium_s.music_track, pap_stream_cnt,
++		     pap_last_pc & 0xffffff, m68k.dar[15] & 0xffffff, v_counter,
++		     pap_bad_hits, (unsigned)m68k.stopped);
++		PAPW("hot tot=%u a=%02X:%u b=%02X:%u c=%02X:%u r0=%06X r1=%06X r2=%06X",
++		     tot,
++		     b1 < 0 ? 0 : (unsigned)b1, n1, b2 < 0 ? 0 : (unsigned)b2, n2,
++		     b3 < 0 ? 0 : (unsigned)b3, n3,
++		     pap_ring_pc[(pap_ring_i - 1) & (PAP_RING_N - 1)] & 0xffffff,
++		     pap_ring_pc[(pap_ring_i - 2) & (PAP_RING_N - 1)] & 0xffffff,
++		     pap_ring_pc[(pap_ring_i - 3) & (PAP_RING_N - 1)] & 0xffffff);
++	}
++#endif
++
++
+ 	for( lcv = 0; lcv < samples; lcv++ ) {
+ 		int l = 0, r = 0;
+ 		int ch;
+@@ -2073,7 +2420,7 @@
+ }
+ 
+ 
+-static void paprium_cmd(int data)
++static void paprium_cmd_inner(int data)
+ {
+ 	int cmd = data >> 8;
+ 	int lcv;
+@@ -2455,6 +2802,32 @@
+ }
+ 
+ 
++/* Wrapper de trace: se o log terminar num "begin" sem o "end"
++   correspondente, o travamento esta' dentro do comando. */
++static void paprium_cmd(int data)
++{
++#if PAPRIUM_TRACE_1FEA
++	int traced = 0;
++
++	if( pap_cmd_n < 8192 ) {
++		PAPW("CMD %02X begin ipc=%06X sp=%06X v=%d n=%u", (unsigned)(data >> 8),
++		     pap_last_pc & 0xffffff, m68k.dar[15] & 0xffffff,
++		     v_counter, pap_cmd_n);
++		pap_cmd_n++;
++		traced = 1;
++	}
++#endif
++
++	paprium_cmd_inner(data);
++
++#if PAPRIUM_TRACE_1FEA
++	if( traced )
++		PAPW("CMD %02X end   ipc=%06X v=%d", (unsigned)(data >> 8),
++		     pap_last_pc & 0xffffff, v_counter);
++#endif
++}
++
++
+ static int paprium_addr_test(uint32 address, int mode)
+ {
+ #if DEBUG_MODE == 0
+@@ -2566,19 +2939,72 @@
+ 		data = 0;
+ 
+ 	else if( address >= 0x1880 && address < 0x1b00 ) {
+-		data = rand() % 256;
++		/* v10: RNG do cartucho DETERMINISTICO. Antes era rand() semeado com
++		   um endereco de pilha, o que fazia cada execucao (e cada build)
++		   tomar um caminho diferente no boot do jogo. */
++		pap_rng_state = pap_rng_state * 1103515245u + 12345u;
++		data = (pap_rng_state >> 16) & 0xff;
+ 		//paprium_s.ram[address^1] = data;  /* dma blowout if no limit */
+ 	}
+ 
++#if PAPRIUM_TRACE_1FEA
++	if( address >= 0x1FE4 && address <= 0x1FEB && pap_1fea_r8 < 128 ) {
++		PAPW("R8 %04X ipc=%06X ir=%04X val=%02X v=%d n=%u", address,
++		     pap_last_pc & 0xffffff, m68k.ir, (unsigned)data, v_counter, pap_1fea_r8);
++		pap_1fea_r8++;
++	}
++#endif
+ 
+ 	return data;
+ }
+ 
+ 
++#if PAPRIUM_TRACE_1FEA
++/* trace dos registradores de status lidos pelo jogo */
++static void pap_trace_reg(const char *tag, uint32 val, unsigned int *cnt, unsigned int *lastpc)
++{
++	unsigned int ipc = pap_last_pc & 0xffffff;
++
++	pap_last_access_tick = paprium_s.audio_tick;
++
++	if( *cnt < 64 || ipc != *lastpc || (*cnt & 0x3FF) == 0 )
++		PAPW("%s ipc=%06X pc=%06X ir=%04X v=%3d val=%04X n=%u", tag,
++		     ipc, m68k.pc & 0xffffff, m68k.ir, v_counter, val, *cnt);
++	*lastpc = ipc;
++	(*cnt)++;
++}
++#endif
++
++
++/* v6: detector de polling na RAM do cartucho (mesmo endereco + mesmo PC em
++   loop). Se o jogo ficar esperando dado que o emulador nunca entrega, isso
++   aparece como "POLL addr=.... pc=......". */
++static uint32 pap_poll_addr;
++static unsigned int pap_poll_pc, pap_poll_n;
++
++static void pap_poll_check(uint32 address)
++{
++	unsigned int pc = pap_last_pc & 0xffffff;
++
++	if( address == pap_poll_addr && pc == pap_poll_pc ) {
++		pap_poll_n++;
++		if( pap_poll_n == 64 || pap_poll_n == 1024 || pap_poll_n == 16384 )
++			PAPW("POLL addr=%04X pc=%06X n=%u v=%3d val=%04X", address, pc,
++			     pap_poll_n, v_counter, *(uint16 *)(paprium_s.ram + address));
++	}
++	else {
++		pap_poll_addr = address;
++		pap_poll_pc = pc;
++		pap_poll_n = 1;
++	}
++}
++
++
+ static uint32 paprium_r16(uint32 address)
+ {
+ 	int data = 0;
+ 
++	pap_poll_check(address);
+ 
+ 	if( (address == 0xC000) && (paprium_s.decoder_size > 0) ) {
+ #if DEBUG_MODE
+@@ -2638,6 +3064,15 @@
+ 	}
+ #endif
+ 
++#if PAPRIUM_TRACE_1FEA
++	if( address == 0x1FEA )
++		pap_trace_reg("R1FEA", (unsigned)data, &pap_1fea_rd, &pap_1fea_pc);
++	else if( address == 0x1FE4 )
++		pap_trace_reg("R1FE4", (unsigned)data, &pap_fe4_rd, &pap_fe4_pc);
++	else if( address == 0x1FE6 )
++		pap_trace_reg("R1FE6", (unsigned)data, &pap_fe6_rd, &pap_fe6_pc);
++#endif
++
+ 	return data;
+ }
+ 
+@@ -2654,6 +3089,14 @@
+ #endif
+ 
+ 	paprium_s.ram[address^1] = data;
++
++#if PAPRIUM_TRACE_1FEA
++	if( address >= 0x1FE4 && address <= 0x1FEB && pap_1fea_w8 < 128 ) {
++		PAPW("W8 %04X ipc=%06X ir=%04X val=%02X v=%d n=%u", address,
++		     pap_last_pc & 0xffffff, m68k.ir, data, v_counter, pap_1fea_w8);
++		pap_1fea_w8++;
++	}
++#endif
+ }
+ 
+ 
+@@ -2673,6 +3116,16 @@
+ 	*(uint16 *)(paprium_s.ram + address) = data;
+ 
+ 	if( address == 0x1FEA ) {
++		pap_last_access_tick = paprium_s.audio_tick;
++#if PAPRIUM_TRACE_1FEA
++		if( pap_1fea_wr < 4096 )
++			PAPW("W1FEA ipc=%06X pc=%06X ir=%04X v=%3d cmd=%04X sp=%06X ra=%06X n=%u",
++			     pap_last_pc & 0xffffff, m68k.pc & 0xffffff, m68k.ir, v_counter,
++			     data, m68k.dar[15] & 0xffffff,
++			     (unsigned int)m68k_read_immediate_32(m68k.dar[15]) & 0xffffff,
++			     pap_1fea_wr);
++		pap_1fea_wr++;
++#endif
+ 		paprium_cmd(data);
+ 
+ 		paprium_cmd_count = 0;
+@@ -2838,7 +3291,7 @@
+ #endif
+ 
+ 
+-	srand((uintptr_t) &ptr);  /* discard time library */
++	srand(0x5A17);  /* v10: semente fixa (antes era o endereco de uma pilha) */
+ 	paprium_s.echo_pan = rand();
+ 
+ 
+@@ -2850,13 +3303,7 @@
+ {
+ 	paprium_init();
+ 
+-	mp3dec_init(&paprium_mp3d);
+-
+-	mp3dec_init(&paprium_mp3d_boss1);
+-	mp3dec_init(&paprium_mp3d_boss2);
+-	mp3dec_init(&paprium_mp3d_boss3);
+-	mp3dec_init(&paprium_mp3d_boss4);
+-	paprium_load_mp3_boss();
++	pap_stream_close();
+ 
+ 
+ 	//extern int trace_start;

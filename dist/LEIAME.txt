@@ -1,0 +1,6 @@
+genesis_plus_gx_paprium_libretro.so / genesis_plus_gx_paprium_libretro-2026.10.26-rk3032.so
+  build ARMv7 (RK3032, glibc 2.29) do Paprium
+  gerado em 2026-10-26 18:46 UTC
+  md5 9f1c6c7a48aa4fbf160ddbc5acedf2c6
+  fonte: core/cart_hw/paprium.h + scripts/build-core.sh (TRACE=0)
+  licenca: GPL do Genesis Plus GX (o codigo-fonte esta neste repositorio)
